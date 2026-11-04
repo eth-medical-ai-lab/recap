@@ -96,6 +96,14 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    compaction_summary_mask: Optional[list[int]] = None
+    """Response-aligned mask selecting generated compaction-summary tokens."""
+    compaction_continuation_action_mask: Optional[list[int]] = None
+    """Response-aligned mask selecting post-compaction action tokens."""
+    compaction_teacher_rollout_logprobs: Optional[list[float]] = None
+    """Full-context rollout-teacher log probabilities aligned to response tokens."""
+    compaction_teacher_rollout_mask: Optional[list[int]] = None
+    """Mask selecting continuation actions with cached rollout-teacher scores."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -121,6 +129,25 @@ class AgentLoopOutput(BaseModel):
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
 
+        compaction_summary_mask = output.pop("compaction_summary_mask", None)
+        if compaction_summary_mask is not None:
+            output["compaction_summary_mask"] = torch.tensor(compaction_summary_mask, dtype=torch.int64)
+        compaction_continuation_action_mask = output.pop("compaction_continuation_action_mask", None)
+        if compaction_continuation_action_mask is not None:
+            output["compaction_continuation_action_mask"] = torch.tensor(
+                compaction_continuation_action_mask, dtype=torch.int64
+            )
+        compaction_teacher_rollout_logprobs = output.pop("compaction_teacher_rollout_logprobs", None)
+        if compaction_teacher_rollout_logprobs is not None:
+            output["compaction_teacher_rollout_logprobs"] = torch.tensor(
+                compaction_teacher_rollout_logprobs, dtype=torch.float32
+            )
+        compaction_teacher_rollout_mask = output.pop("compaction_teacher_rollout_mask", None)
+        if compaction_teacher_rollout_mask is not None:
+            output["compaction_teacher_rollout_mask"] = torch.tensor(
+                compaction_teacher_rollout_mask, dtype=torch.int64
+            )
+
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
@@ -143,7 +170,9 @@ class AgentLoopOutput(BaseModel):
         reward_score = output.pop("reward_score", None)
         if reward_score is not None:
             rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
-            rm_scores[-1] = reward_score
+            trainable_positions = torch.nonzero(output["response_mask"], as_tuple=False).flatten()
+            if len(trainable_positions) > 0:
+                rm_scores[trainable_positions[-1]] = reward_score
             output["rm_scores"] = rm_scores
 
         teacher_ids, teacher_logprobs = (
@@ -172,6 +201,14 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded position ids."""
     response_mask: torch.Tensor
     """Padded response mask."""
+    compaction_summary_mask: Optional[torch.Tensor] = None
+    """Padded response-aligned compaction-summary mask."""
+    compaction_continuation_action_mask: Optional[torch.Tensor] = None
+    """Padded response-aligned post-compaction action mask."""
+    compaction_teacher_rollout_logprobs: Optional[torch.Tensor] = None
+    """Padded full-context rollout-teacher log probabilities."""
+    compaction_teacher_rollout_mask: Optional[torch.Tensor] = None
+    """Padded mask selecting cached rollout-teacher action scores."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -311,13 +348,14 @@ class AgentLoopBase(ABC):
         self,
         messages: list[dict],
         tools: list[dict] = None,
+        truncate_to_prompt_length: bool = True,
     ) -> list[int]:
         """Build the initial prompt token ids with Continuous Token."""
         prompt_ids = await self.loop.run_in_executor(
             None,
             lambda: self.continuous_token_builder.build_initial_tokens(messages, tools=tools),
         )
-        return self._cap_text_prompt_length(prompt_ids)
+        return self._cap_text_prompt_length(prompt_ids) if truncate_to_prompt_length else prompt_ids
 
     async def ct_merge_non_assistant_msg(
         self,
@@ -629,6 +667,7 @@ class AgentLoopWorker:
             index = batch.non_tensor_batch["index"]
         else:
             index = np.arange(len(batch))
+        log_trajectory_txt = batch.non_tensor_batch.get("__log_trajectory_txt__")
 
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
 
@@ -656,19 +695,49 @@ class AgentLoopWorker:
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            kwargs = {
+                k: v[i]
+                for k, v in batch.non_tensor_batch.items()
+                if k not in {"__do_sample__", "__log_trajectory_txt__", "__agent_loop_parent_index__"}
+            }
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
+            if log_trajectory_txt is not None:
+                trajectory_info[i]["log_trajectory_txt"] = bool(log_trajectory_txt[i])
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        try:
+            outputs_by_sample = await asyncio.gather(*tasks)
+        except BaseException:
+            # A failed trajectory does not make gather cancel its siblings.
+            # Wait for their environment finalizers before the group exits.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        parent_indices = batch.non_tensor_batch.get("__agent_loop_parent_index__", np.arange(len(batch)))
+        outputs = []
+        local_parent_indices = []
+        # Local indices expand this worker's metadata. Global indices align the
+        # concatenated outputs with the original batch, including padded parents.
+        for sample_idx, sample_outputs in enumerate(outputs_by_sample):
+            for output in sample_outputs:
+                output.extra_fields["rollout_parent_index"] = int(parent_indices[sample_idx])
+                local_parent_indices.append(sample_idx)
+                outputs.append(output)
 
+        input_non_tensor_batch = {
+            key: value[local_parent_indices]
+            for key, value in batch.non_tensor_batch.items()
+            if key not in {"__log_trajectory_txt__", "__agent_loop_parent_index__"}
+        }
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs, input_non_tensor_batch=input_non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
         return output
 
@@ -680,7 +749,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -704,8 +773,18 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            loop_kwargs = dict(kwargs)
+            loop_kwargs["validate"] = trajectory["validate"]
+            loop_kwargs["global_steps"] = trajectory["step"]
+            loop_kwargs["sample_index"] = trajectory["sample_index"]
+            loop_kwargs["rollout_n"] = trajectory["rollout_n"]
+            loop_kwargs["log_trajectory_txt"] = trajectory.get("log_trajectory_txt", False)
+            output = await agent_loop.run(sampling_params, **loop_kwargs)
+            outputs = output if isinstance(output, list) else [output]
+            return [
+                await self._agent_loop_postprocess(item, trajectory["validate"], **kwargs)
+                for item in outputs
+            ]
 
     def _pad_token_ids(
         self,
@@ -741,6 +820,20 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+        # Failed resets have no model input. A single non-response sentinel
+        # keeps Qwen RoPE/remove-padding valid without inventing an action or loss.
+        empty_failure = not output.prompt_ids and not output.response_ids
+        if empty_failure:
+            if output.extra_fields.get("finish_reason") not in {"environment_error", "rollout_timeout"}:
+                raise ValueError("An agent returned empty input without a classified failure.")
+            sentinel = next((token for token in (
+                getattr(self.tokenizer, "bos_token_id", None), getattr(self.tokenizer, "eos_token_id", None),
+                self.tokenizer.pad_token_id,
+            ) if token is not None), 0)
+            output.prompt_ids = [sentinel]
+            output.response_mask = []
+            output.response_logprobs = []
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -790,6 +883,40 @@ class AgentLoopWorker:
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+        compaction_summary_mask = None
+        if output.compaction_summary_mask is not None:
+            compaction_summary_mask = self._pad_token_ids(
+                output.compaction_summary_mask,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=False,
+            )["input_ids"]
+            compaction_summary_mask *= response_output["attention_mask"]
+        compaction_continuation_action_mask = None
+        if output.compaction_continuation_action_mask is not None:
+            compaction_continuation_action_mask = self._pad_token_ids(
+                output.compaction_continuation_action_mask,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=False,
+            )["input_ids"]
+            compaction_continuation_action_mask *= response_output["attention_mask"]
+        compaction_teacher_rollout_logprobs = None
+        if output.compaction_teacher_rollout_logprobs is not None:
+            pad_size = self.rollout_config.response_length - len(output.compaction_teacher_rollout_logprobs)
+            compaction_teacher_rollout_logprobs = torch.tensor(
+                output.compaction_teacher_rollout_logprobs + [0.0] * pad_size,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        compaction_teacher_rollout_mask = None
+        if output.compaction_teacher_rollout_mask is not None:
+            compaction_teacher_rollout_mask = self._pad_token_ids(
+                output.compaction_teacher_rollout_mask,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=False,
+            )["input_ids"]
+            compaction_teacher_rollout_mask *= response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
@@ -863,6 +990,10 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
+            compaction_summary_mask=compaction_summary_mask,
+            compaction_continuation_action_mask=compaction_continuation_action_mask,
+            compaction_teacher_rollout_logprobs=compaction_teacher_rollout_logprobs,
+            compaction_teacher_rollout_mask=compaction_teacher_rollout_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -1062,8 +1193,23 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        for field in (
+            "compaction_summary_mask", "compaction_continuation_action_mask",
+            "compaction_teacher_rollout_logprobs", "compaction_teacher_rollout_mask", "response_logprobs",
+        ):
+            values = [getattr(item, field) for item in inputs]
+            reference = next((value for value in values if value is not None), None)
+            if reference is None:
+                continue
+            # A pre-generation failure can appear anywhere in a mixed group.
+            # Only rows with no trainable response may omit these tensors.
+            for i, value in enumerate(values):
+                if value is None:
+                    if inputs[i].response_mask.any():
+                        raise ValueError(f"Trainable rollout is missing {field}.")
+                    values[i] = torch.zeros_like(reference)
+            key = "rollout_log_probs" if field == "response_logprobs" else field
+            optional_outputs[key] = torch.cat(values, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
@@ -1085,10 +1231,11 @@ class AgentLoopWorker:
 
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):
-            prompt_length = prompt_ids.size(1)
-            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+            for row, score in enumerate(scores):
+                trainable_positions = torch.nonzero(response_mask[row], as_tuple=False).flatten()
+                if len(trainable_positions) > 0:
+                    rm_scores[row, trainable_positions[-1]] = float(score)
             batch["rm_scores"] = rm_scores
 
         non_tensor_batch = {
@@ -1113,11 +1260,17 @@ class AgentLoopWorker:
         # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
         extra_fields = {}
         default_extra_keys = {
+            "swe_infrastructure_failure",
+            "swe_cleanup_failed",
+            "rollout_failure_type",
+            "gym_swebench_failure_path",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",
             "max_global_steps",
             "extras",
+            "gym_trajectory_txt_path",
+            "gym_trajectory_txt_paths",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
@@ -1231,6 +1384,14 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        train_trajectories_to_log = int(self.config.trainer.get("log_train_trajectory_txt", 0) or 0)
+        validate = bool(prompts.meta_info.get("validate", False))
+        if train_trajectories_to_log > 0 and not validate:
+            log_flags = np.zeros(len(prompts), dtype=bool)
+            log_flags[: min(train_trajectories_to_log, len(prompts))] = True
+            prompts.non_tensor_batch["__log_trajectory_txt__"] = log_flags
+        prompts.non_tensor_batch["__agent_loop_parent_index__"] = np.arange(len(prompts), dtype=np.int64)
+
         # Attach per-sample priority to the batch (like ``uid``) so each sample gets
         # a globally-unique priority that flows to vLLM request scheduling. Assigned
         # before chunking so chunks own disjoint ranges without per-worker offsets.

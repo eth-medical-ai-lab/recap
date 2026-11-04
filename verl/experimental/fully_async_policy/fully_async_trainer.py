@@ -23,6 +23,7 @@ import ray
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
+from agent_system.metrics import compute_episode_metrics, compute_format_metrics
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -35,6 +36,7 @@ from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.recap import pad_compaction_batch_for_data_parallel
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -401,7 +403,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_len = 0
         while len(queue_samples) < self.required_samples:
             # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = await self.message_queue_client.get_sample()
+            queue_item = await self.message_queue_client.get_sample()
+            if queue_item is None:
+                print("[FullyAsyncTrainer] Message queue shut down during sample collection")
+                break
+            sample, queue_len = queue_item
 
             if sample is None:
                 print(
@@ -437,11 +443,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # Assemble batch - now working directly with RolloutSample objects
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+
+        # Compaction produces a variable number of segments per trajectory. Pad
+        # only the batch rows needed by data parallelism and mask their loss.
+        actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        batch = pad_compaction_batch_for_data_parallel(batch, actor_dp_size)
         if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+            self._balance_batch(batch, metrics={})
+        batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(dim=-1).tolist()
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         self._step_wait_times.append(total_wait_time)
@@ -482,6 +492,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.actor_wg = self.all_wg[str(self.train_role)]
         self.actor_wg.init_model()
+        recap = self.config.algorithm.get("compaction_distortion", {})
+        self.teacher_ema_rate = recap.get("teacher_ema_rate") if recap.get("enabled") else None
+        if self.teacher_ema_rate is not None:
+            self.actor_wg.init_compaction_teacher(self.teacher_ema_rate)
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
     async def init_workers(self):
@@ -518,7 +532,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
-        while True:
+        # Stop at the configured update count. In dynamic mode, asking for one
+        # more step can otherwise wait forever for rollout samples after the
+        # producer has already emitted its final batch.
+        while self.current_param_version < self.total_train_steps:
             try:
                 await self.fit_step()
             except TrainingStopException:
@@ -526,12 +543,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 break
 
         self.progress_bar.close()
+        stop_reason = await self.rollouter.get_swe_failure_stop_reason.remote()
+        if stop_reason:
+            # Evaluation uses the same unavailable environment. Save the current
+            # policy even if periodic checkpoints are disabled, then exit.
+            print(f"[FullyAsyncTrainer] {stop_reason} Saving checkpoint and exiting.")
+            self._save_checkpoint()
+            self.last_ckpt_version = self.current_param_version
+            return
+        # Persist completed updates before a potentially long final evaluation.
+        self._fit_save_checkpoint(force=True)
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             rollout_reset_timing_raw = await self._fit_update_weights()
             if rollout_reset_timing_raw is not None:
                 self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-            await self._fit_validate()
-        self._fit_save_checkpoint(force=True)
+            await self._fit_validate(force=self.current_param_version >= self.total_train_steps)
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -595,8 +621,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
             self._record_train_resource_utilization(allocated_time=time.time() - _allocated_start)
 
-        await self._fit_validate()
+        # A validation timeout must not discard an already completed checkpoint.
         self._fit_save_checkpoint()
+        await self._fit_validate()
         self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
         if rollout_reset_timing_raw is not None:
@@ -648,20 +675,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
     def _compute_old_log_prob(self, batch: DataProto):
-        """
-        If algorithm.rollout_correction.bypass_mode is False,
-        use model engine and first version model params to re-calculate old_log_prob.
+        """Recompute old log-probabilities under the first policy in a local-update group."""
+        if self.trigger_parameter_sync_step == 1:
+            # There is no later local update that can reuse a snapshot. The
+            # current trainer policy is already the proximal old policy.
+            return super()._compute_old_log_prob(batch)
 
-        If local_trigger_step == 1, load the training engine's parameters to the CPU
-          and save a copy for subsequent MIS use.
-
-        If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-        then restore the parameters of the current version.
-        """
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
@@ -718,6 +742,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             ctx.total_generated_samples = _total_generated_samples
             ctx.expected_samples = _expect_samples
             ctx.buffer_samples = _buffer_sampels
+            # Query the actual backlog; generated-minus-expected drifts when a
+            # training batch consumes queued groups without new production.
+            ctx.queued_samples = await self.message_queue_client.get_queue_size()
             ctx.step_wait_times = list(self._step_wait_times)
             ctx.step_wait_samples = list(self._step_wait_samples)
             should_activate = ctrl.policy.should_activate_after_step(
@@ -727,6 +754,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
+            if self.teacher_ema_rate is not None:
+                self.actor_wg.update_compaction_teacher(self.current_param_version)
             # Step 1: NCCL broadcast from trainer to standalone rollout replicas.
             # Skipped when there are no standalone replicas (e.g. rollout.nnodes=0,
             # all rollout is hybrid) -- there is nothing to sync weights to.
@@ -809,7 +838,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
         self.metrics_aggregator.reset()
 
-    async def _fit_validate(self, val_before_train=False):
+    async def _fit_validate(self, val_before_train=False, force=False):
         if self.local_trigger_step != 1:
             return
 
@@ -820,7 +849,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             and self.current_param_version > 0
         )
         # Skip validation if not needed and not validation before training
-        if not need_validate and not val_before_train:
+        if not need_validate and not val_before_train and not (force and self.config.trainer.test_freq > 0):
             return
         # Execute validation
         if self.config.async_training.use_trainer_do_validate:
@@ -833,6 +862,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Run trainer-side validation using hybrid rollout replicas."""
         print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
         validate_start = time.time()
+        ctrl = self.dynamic_resource_controller
+        hybrid_was_active = ctrl is not None and ctrl.is_hybrid_active
         # ================================================================
         # Phase 1: Switch ALL trainer GPUs to ROLLOUT mode
         # ================================================================
@@ -856,16 +887,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.logger.log(data=val_metrics, step=self.current_param_version)
 
         # ================================================================
-        # Phase 3: Switch hybrid GPUs back to TRAIN mode
+        # Phase 3: Restore the pre-validation state, including active rollout GPUs.
         # ================================================================
-        print("[FullyAsyncTrainer] Phase 3: Switching hybrid GPUs back to TRAIN mode")
-        await self.checkpoint_manager.abort_replicas()
-        await self.hybrid_checkpoint_manager.abort_replicas()
-        # Batch remove all hybrid replicas from the load balancer in a single RPC.
-        await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
-        await self.hybrid_checkpoint_manager.sleep_replicas()
-        await self.checkpoint_manager.resume_generation_replicas()
-        await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        print(f"[FullyAsyncTrainer] Phase 3: Restoring hybrid_active={hybrid_was_active}")
+        # Removing active replicas here would leave the controller believing
+        # they still help collect the next batch. Inactive/no-controller runs
+        # retain the original behavior of releasing trainer GPU memory.
+        if not hybrid_was_active:
+            await self.checkpoint_manager.abort_replicas()
+            await self.hybrid_checkpoint_manager.abort_replicas()
+            await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+            await self.hybrid_checkpoint_manager.sleep_replicas()
+            await self.checkpoint_manager.resume_generation_replicas()
+            await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
         total_time = time.time() - validate_start
         print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
@@ -1008,7 +1042,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(f"[FullyAsyncTrainer] Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.current_param_version = int(global_step_folder.split("global_step_")[-1])
-        self.global_steps = self.current_param_version * self.trigger_parameter_sync_step + 1
+        # fit() advances once before processing its first batch. Restore the
+        # completed-update count here so the resumed batch gets the same next
+        # step number as an uninterrupted run.
+        self.global_steps = self.current_param_version * self.trigger_parameter_sync_step
         self.last_ckpt_version = self.current_param_version
         print(
             f"[FullyAsyncTrainer] Setting global step to {self.global_steps}, "
@@ -1047,3 +1084,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+
+    def _fit_collect_metrics(self, batch: DataProto):
+        super()._fit_collect_metrics(batch)
+        self.metrics.update(compute_episode_metrics(batch=batch))
+        self.metrics.update(compute_format_metrics(batch=batch))

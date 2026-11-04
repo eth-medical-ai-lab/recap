@@ -40,6 +40,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
+from verl.trainer.ppo.recap import apply_recap_advantage, recap_needs_scoring
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
@@ -509,23 +510,38 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+            actor_config = self.config.actor_rollout_ref.actor
+            if actor_config.loss_agg_mode == "trajectory-mean-token-mean":
+                # Compaction supplies logical-trajectory token weights to the
+                # vanilla clipped loss. Here bypass only selects pi_rollout as
+                # the denominator; the generic bypass loss does not accept
+                # those weights.
+                if "rollout_log_probs" not in batch.batch:
+                    raise ValueError("bypass_mode=True requires rollout_log_probs in the batch.")
+                batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+            else:
+                from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
-            apply_bypass_mode(
-                batch=batch,
-                rollout_corr_config=rollout_corr_config,
-                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-            )
+                apply_bypass_mode(
+                    batch=batch,
+                    rollout_corr_config=rollout_corr_config,
+                    policy_loss_config=actor_config.policy_loss,
+                )
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 actor_config = self.config.actor_rollout_ref.actor
+                entropy_loss_mode = actor_config.loss_agg_mode
+                if entropy_loss_mode == "trajectory-mean-token-mean":
+                    # Logical-trajectory weights are created with advantages,
+                    # after this diagnostic old-policy forward.
+                    entropy_loss_mode = "seq-mean-token-mean"
                 entropy_agg = agg_loss(
                     loss_mat=entropys,
                     loss_mask=response_masks,
-                    loss_agg_mode=actor_config.loss_agg_mode,
+                    loss_agg_mode=entropy_loss_mode,
                     loss_scale_factor=actor_config.loss_scale_factor,
                 )
                 old_log_prob_metrics = {
@@ -548,6 +564,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     metrics.update(calculate_debug_metrics(batch))
 
         assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+        distortion_config = self.config.algorithm.get("compaction_distortion", {})
+        if recap_needs_scoring(distortion_config, self.global_steps):
+            with marked_timer("compaction_distortion", timing_raw, color="blue"):
+                batch, distortion_metrics = self._compute_compaction_distortion(batch)
+            metrics.update(distortion_metrics)
         return batch
 
     def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:
@@ -620,6 +641,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 config=self.config.algorithm,
             )
+            batch = apply_recap_advantage(batch, self.config.algorithm.get("compaction_distortion", {}))
         return batch
 
     def _fit_update_critic(self, batch: DataProto) -> DataProto:
@@ -663,6 +685,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         if rollout_data_dir:
             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+        self._maybe_log_train_trajectory_txt(batch)
 
     def _fit_validate(self):
         metrics = self.metrics

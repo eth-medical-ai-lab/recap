@@ -23,7 +23,9 @@ import numpy as np
 import ray
 import torch
 from omegaconf import DictConfig, open_dict
+from ray.exceptions import RayTaskError
 
+from agent_system.envs.swe_agent import SweAgentServiceError
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -51,6 +53,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _set_rollout_sample_uid(batch: DataProto, sample_id: str) -> None:
+    """Assign one fallback uid group to all rows from a normal parent sample."""
+    batch.non_tensor_batch["uid"] = np.array([f"uid_{sample_id}"] * len(batch), dtype=object)
+
+
+def _ensure_rollout_sample_uid(batch: DataProto, sample_id: str) -> None:
+    """Keep generated segment uids when an agent loop already set them."""
+    uid = batch.non_tensor_batch.get("uid")
+    if uid is not None and len(uid) == len(batch) and all(item is not None for item in uid):
+        return
+    _set_rollout_sample_uid(batch, sample_id)
+
+
 class FullyAsyncLLMServerManager(LLMServerManager):
     """Extension of :class:`LLMServerManager` for fully async training with hybrid scheduling."""
 
@@ -64,6 +79,9 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         # Pre-registered hybrid replicas: bound at init time but still sleeping.
         # Keyed by resource_id; populated during _initialize_llm_servers().
         self.hybrid_replicas: dict[str, RolloutReplica] = {}
+        # Keep the immutable standalone set separate from rollout_replicas,
+        # which also contains any hybrid replicas activated at runtime.
+        self.standalone_replicas: list[RolloutReplica] = []
         # Currently active (awake + in LB) subset of hybrid replicas.
         self.alive_replicas: dict[str, RolloutReplica] = {}
         # resource_id → server_address for alive hybrid replicas.
@@ -127,6 +145,8 @@ class FullyAsyncLLMServerManager(LLMServerManager):
                 with open_dict(self.rollout_config):
                     self.rollout_config.gpu_memory_utilization = original_gmu
             self.worker_group = saved_worker_group
+
+        self.standalone_replicas = list(self.rollout_replicas)
 
         # Update Prometheus with the final (standalone) addresses.
         if self.rollout_config.prometheus.enable:
@@ -279,15 +299,11 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
     def get_active_server_count(self) -> int:
         """Total active rollout servers (standalone + hybrid)."""
-        return len(self.rollout_replicas) + len(self.alive_replicas)
+        return len(self.rollout_replicas)
 
     def get_standalone_replicas(self) -> list:
-        """Return standalone-only replicas (hybrid replicas excluded).
-
-        ``rollout_replicas`` only ever holds standalone replicas; hybrid
-        replicas live separately in ``alive_replicas``/``hybrid_replicas``.
-        """
-        return self.rollout_replicas
+        """Return standalone-only replicas (hybrid replicas excluded)."""
+        return self.standalone_replicas
 
     def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> LLMServerClient:
         """Override to automatically inject ``only_hybrid`` into the client.
@@ -298,7 +314,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         raising immediately. Defaults to :class:`FullyAsyncLLMServerClient` since
         ``only_hybrid`` retry support is only implemented there.
         """
-        only_hybrid = len(self.rollout_replicas) == 0
+        only_hybrid = len(self.standalone_replicas) == 0
         return super().get_client(client_cls=client_cls, only_hybrid=only_hybrid, **kwargs)
 
 
@@ -312,9 +328,22 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
+        train_trajectories_to_log = int(self.config.trainer.get("log_train_trajectory_txt", 0) or 0)
+        validate = bool(prompts.meta_info.get("validate", False))
+        if train_trajectories_to_log > 0 and not validate:
+            log_flags = np.zeros(len(prompts), dtype=bool)
+            log_flags[: min(train_trajectories_to_log, len(prompts))] = True
+            prompts.non_tensor_batch["__log_trajectory_txt__"] = log_flags
+
         worker = self._select_best_worker()
         output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        try:
+            return await asyncio.wrap_future(output_future.future())
+        except asyncio.CancelledError:
+            # Cancelling the local waiter alone leaves the remote episodes alive.
+            # Ray cancellation lets their environment finalizers run as well.
+            ray.cancel(output_future)
+            raise
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
@@ -454,6 +483,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.paused = False
         self.running = True
 
+        # Count final logical rollouts across all workers, after episode retries.
+        self._swe_failure_history = collections.deque(maxlen=50)
+        self._swe_failure_stop_reason = None
+
         # Add dataloader lock
         self.dataloader_lock = asyncio.Lock()
 
@@ -482,6 +515,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # `_resume_event` signals that the rollouter is currently running (paused == False).
         self._resume_event = asyncio.Event()
         self._resume_event.set()
+        self._swe_failure_stop = asyncio.Event()
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -862,6 +896,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         for epoch, batch_dict in continuous_iterator:
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
+            # Fully async writes trajectories at generation time, before PPO consumes the sample.
+            full_batch.meta_info["global_steps"] = self.global_steps
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
@@ -992,16 +1028,33 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
         # Embed sample_id into prompts for skip management
-        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-        )
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        _set_rollout_sample_uid(rollout_sample.full_batch, rollout_sample.sample_id)
+        if self._swe_failure_stop.is_set():
+            return
+        try:
+            ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        except Exception as exc:
+            # Ray task errors can nest across the environment and agent actors.
+            # Only a typed global environment failure uses the checkpoint stop.
+            cause = exc
+            while isinstance(cause, RayTaskError):
+                cause = cause.cause
+            if isinstance(cause, SweAgentServiceError) and cause.is_fatal:
+                if self._swe_failure_stop_reason is None:
+                    self._swe_failure_stop_reason = (
+                        f"SWE environment cannot continue: {cause.kind} "
+                        f"(sample_id={rollout_sample.sample_id}): {cause}"
+                    )
+                    logger.exception(self._swe_failure_stop_reason)
+                self._swe_failure_stop.set()
+                return
+            raise
 
+        self._record_swe_outcomes(ret)
+        if self._swe_failure_stop.is_set():
+            return
         rollout_sample.full_batch = ret
-        # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
-        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-        )
+        _ensure_rollout_sample_uid(rollout_sample.full_batch, rollout_sample.sample_id)
         rollout_sample.rollout_status = await self.get_statistics()
 
         success = await self.message_queue_client.put_sample(
@@ -1013,6 +1066,42 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    def _record_swe_outcomes(self, batch):
+        """Stop after ten environment failures within the latest fifty rollouts."""
+        fields = batch.non_tensor_batch
+        failures = fields.get("swe_infrastructure_failure")
+        if failures is None:
+            return
+
+        # Compaction creates multiple rows per trajectory. Padding and other
+        # environments (whose flag is None) must not enter the SWE window.
+        trajectory_ids = fields.get("compaction_trajectory_uid")
+        padding = fields.get("compaction_padding")
+        outcomes = {}
+        for row, failed in enumerate(failures):
+            if failed is None or (padding is not None and padding[row]):
+                continue
+            trajectory = trajectory_ids[row] if trajectory_ids is not None else row
+            if trajectory is None:
+                trajectory = row
+            outcomes[trajectory] = outcomes.get(trajectory, False) or bool(failed)
+
+        for failed in outcomes.values():
+            self._swe_failure_history.append(failed)
+            failure_count = sum(self._swe_failure_history)
+            if failure_count >= 10 and self._swe_failure_stop_reason is None:
+                self._swe_failure_stop_reason = (
+                    f"SWE environment failures: {failure_count} of the latest "
+                    f"{len(self._swe_failure_history)} rollouts (stop threshold: 10 within 50). "
+                    "Check sandbox/failure logs before restarting."
+                )
+                logger.error(self._swe_failure_stop_reason)
+                self._swe_failure_stop.set()
+
+    async def get_swe_failure_stop_reason(self):
+        """Let the trainer checkpoint on an environment outage instead of validating."""
+        return self._swe_failure_stop_reason
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -1026,26 +1115,35 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Start sample feed coroutine, streaming process coroutine
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
         self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
+        failure_stop_task = asyncio.create_task(self._swe_failure_stop.wait())
 
         try:
             # Wait for sample feed to complete
             # Use asyncio.wait to monitor all tasks. If processor exits early,
             # detect it instead of blocking on feed_task (it might be stuck on a full queue).
             done, pending = await asyncio.wait(
-                [self.feed_task, self.processor_task], return_when=asyncio.FIRST_COMPLETED
+                [self.feed_task, self.processor_task, failure_stop_task], return_when=asyncio.FIRST_COMPLETED
             )
 
             for task in done:
                 if task.exception():
                     raise task.exception()
 
+            if self._swe_failure_stop.is_set():
+                return
             if self.feed_task not in done:
                 raise RuntimeError("Processor task exited prematurely")
 
             print("[FullyAsyncRollouter] Sample feed completed")
 
             # Wait for streaming to complete
-            await self.processor_task
+            done, _ = await asyncio.wait(
+                [self.processor_task, failure_stop_task], return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self.processor_task in done:
+                await self.processor_task
+            if self._swe_failure_stop.is_set():
+                return
             print("[FullyAsyncRollouter] Streaming process completed")
 
             await self.pending_queue.join()
@@ -1056,6 +1154,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             raise e
 
         finally:
+            failure_stop_task.cancel()
+            await asyncio.gather(failure_stop_task, return_exceptions=True)
             if self.feed_task and not self.feed_task.done():
                 self.feed_task.cancel()
                 await asyncio.gather(self.feed_task, return_exceptions=True)
@@ -1066,6 +1166,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             self.feed_task = None
             self.processor_task = None
+
+            # Cancel in-flight groups before closing the queue. Their episode
+            # finalizers and the job-exit E2B sweep own sandbox cleanup.
+            if self._swe_failure_stop.is_set():
+                active = list(self.active_tasks)
+                for task in active:
+                    task.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
+                self.active_tasks.clear()
 
             # Send a finish signal
             await self.message_queue_client.put_sample(sample=None)
@@ -1095,10 +1204,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
-            # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-        except Exception as e:
-            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            # Let failures reach FullyAsyncTaskRunner so it can cancel the
+            # trainer instead of leaving it blocked on an empty queue.
+            await asyncio.gather(generation_task, monitor_task)
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1173,6 +1281,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
             "count/total_generated_samples": self.total_generated_samples,
+            "swe/environment_failures_recent": sum(self._swe_failure_history),
+            "swe/rollouts_recent": len(self._swe_failure_history),
+            "swe/stopped_for_environment_failures": int(self._swe_failure_stop.is_set()),
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
             # static stats
@@ -1347,12 +1458,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         poll_interval: float = 1.0,
         timeout: float | None = None,
     ) -> int:
-        """Block until the message queue contains at least ``required_count`` samples.
+        """Wait for enough queued samples, or let the trainer exit on a SWE outage.
 
         Polls ``message_queue_client.get_queue_size()`` every ``poll_interval``
-        seconds and returns only when the queue size reaches or exceeds
-        ``required_count``.  If ``required_count`` is ``None``, defaults to
-        ``self.required_samples``.
+        seconds and returns when the queue reaches ``required_count`` or SWE
+        generation has stopped. An outage must release this wait so the trainer
+        can consume the termination signal and save its current checkpoint.
 
         The Trainer uses this to confirm that the queue truly holds enough
         completed trajectories *before* deactivating hybrid replicas — avoiding a
@@ -1366,7 +1477,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 exceeded.  ``None`` means no timeout.
 
         Returns:
-            The final queue size observed (≥ required_count).
+            The final queue size, possibly below ``required_count`` on a SWE outage.
 
         Raises:
             TimeoutError: If ``timeout`` is set and the wait exceeds it.
@@ -1375,6 +1486,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         start_time = time.time()
         while True:
             queue_size = await self.message_queue_client.get_queue_size()
+            if self._swe_failure_stop.is_set():
+                return queue_size
             if queue_size >= required_count:
                 print(
                     f"[FullyAsyncRollouter] wait_for_enough_samples: "

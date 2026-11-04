@@ -35,6 +35,31 @@ logger = logging.getLogger(__file__)
 # excluding calls to generate method.
 CONTROL_METHOD_CONCURRENCY = 16
 
+# Concurrent rollout replicas used to ask the OS for an ephemeral port and
+# release it before their checkpoint workers bound it. The OS could hand the
+# same port to two replicas. Give each replica a small, disjoint low-port range
+# so Ray can still skip ports occupied by another service without that race.
+_CHECKPOINT_ENGINE_PORT_BASE = 20000
+_CHECKPOINT_ENGINE_PORTS_PER_REPLICA = 16
+_CHECKPOINT_ENGINE_REPLICAS_PER_ROLE = 256
+
+
+def _checkpoint_engine_master_port_range(
+    replica_rank: int,
+    is_reward_model: bool,
+    is_teacher_model: bool,
+) -> list[int]:
+    """Return a disjoint rendezvous-port range for one rollout replica."""
+    if replica_rank < 0 or replica_rank >= _CHECKPOINT_ENGINE_REPLICAS_PER_ROLE:
+        raise ValueError(f"replica_rank must be in [0, {_CHECKPOINT_ENGINE_REPLICAS_PER_ROLE}).")
+    if is_reward_model and is_teacher_model:
+        raise ValueError("A rollout replica cannot be both a reward model and a teacher model.")
+
+    role = 1 if is_reward_model else 2 if is_teacher_model else 0
+    slot = role * _CHECKPOINT_ENGINE_REPLICAS_PER_ROLE + replica_rank
+    start = _CHECKPOINT_ENGINE_PORT_BASE + slot * _CHECKPOINT_ENGINE_PORTS_PER_REPLICA
+    return [start, start + _CHECKPOINT_ENGINE_PORTS_PER_REPLICA]
+
 
 class TokenOutput(BaseModel):
     token_ids: list[int]
@@ -181,6 +206,11 @@ class RolloutReplica(ABC):
             bin_pack=False,
             name_prefix=name_prefix,
             use_gpu=use_gpu,
+            master_port_range=_checkpoint_engine_master_port_range(
+                self.replica_rank,
+                self.is_reward_model,
+                self.is_teacher_model,
+            ),
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -220,6 +250,11 @@ class RolloutReplica(ABC):
             bin_pack=False,
             name_prefix=name_prefix,
             use_gpu=True,
+            master_port_range=_checkpoint_engine_master_port_range(
+                self.replica_rank,
+                self.is_reward_model,
+                self.is_teacher_model,
+            ),
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers

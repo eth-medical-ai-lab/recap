@@ -46,6 +46,11 @@ class FullyAsyncTaskRunner:
     def run(self, config):
         print("[ASYNC MAIN] Starting fully async PPO training...")
         self._initialize_components(config)
+        if config.trainer.get("val_only", False):
+            if not config.trainer.get("val_before_train", True):
+                raise ValueError("trainer.val_only=True requires trainer.val_before_train=True")
+            print("[ASYNC MAIN] Validation-only run completed")
+            return
         self._run_training_loop()
 
     def _initialize_components(self, config) -> None:

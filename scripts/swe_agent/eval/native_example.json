@@ -1,0 +1,35 @@
+{
+  "nodes": 1,
+  "gpus_per_node": 4,
+  "data_path": "data/swe_agent/tasks/test.jsonl",
+  "output_dir": "runs/swe_native",
+  "max_tasks": null,
+  "samples_per_task": 2,
+  "max_active_episodes": 48,
+  "max_tokens": 8192,
+  "max_model_len": 131072,
+  "max_episode_tokens": 131072,
+  "max_turns": 200,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "episode_timeout_seconds": 21600,
+  "model": {
+    "path": "/path/to/model",
+    "repo": "Qwen/Qwen3.5-4B",
+    "revision": "REPLACE_WITH_CHECKPOINT_COMMIT",
+    "name": "policy",
+    "tp": 1,
+    "template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "environment": {
+    "e2b_timeout_seconds": 5400,
+    "e2b_create_max_retries": 4,
+    "command_timeout_seconds": 120,
+    "evaluation_timeout_seconds": 600,
+    "observation_char_cap": 6000,
+    "max_format_errors": 3
+  }
+}

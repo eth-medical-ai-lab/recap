@@ -808,6 +808,18 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  compaction_distortion:
+    _target_: verl.trainer.config.CompactionDistortionConfig
+    enabled: false
+    coef: 0.1
+    summary_pg_coef: null
+    continuation_sd_coef: null
+    summary_baseline: leave_one_out
+    scoring_policy: pi_rollout
+    sd_advantage_clip: 5.0
+    teacher_ema_rate: null
+    clipping: joint
+    distortion_measure_interval: 0
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig
     enable: false
@@ -904,6 +916,14 @@ trainer:
   - console
   - wandb
   log_val_generations: 0
+  log_val_trajectory_txt: 0
+  log_train_trajectory_txt: 0
+  gym_trajectory_dir: null
+  gym_env_kwargs: {}
+  gym_max_tokens: 4096
+  gym_max_episode_tokens: null
+  gym_rollout_timeout_seconds: null
+  gym_swebench_failure_dir: null
   rollout_data_dir: null
   validation_data_dir: null
   nnodes: 1

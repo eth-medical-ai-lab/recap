@@ -84,10 +84,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if "trajectory_loss_weights" in data:
+        fields.append("trajectory_loss_weights")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    recap_terms = [
+        key for key in ("recap_summary_loss_advantages", "recap_continuation_loss_advantages") if key in data
+    ]
+    fields.extend(recap_terms)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -95,13 +101,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+    trajectory_loss_weights = data.get("trajectory_loss_weights", None)
 
     loss_agg_mode = config.loss_agg_mode
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
+    policy_loss_kwargs = dict(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -110,6 +117,18 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
+
+    if trajectory_loss_weights is not None:
+        # Every RECAP objective uses the same trajectory weights and PPO thresholds.
+        if loss_mode != "vanilla":
+            raise ValueError("Trajectory-balanced compaction requires policy_loss.loss_mode='vanilla'.")
+        policy_loss_kwargs["trajectory_loss_weights"] = trajectory_loss_weights
+    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
+    # Separate clipping reuses this forward's logprobs; sum before the single backward.
+    # The ordinary PPO diagnostics describe the task term in this mode.
+    for key in recap_terms:
+        auxiliary_loss, _ = policy_loss_fn(**{**policy_loss_kwargs, "advantages": data[key]})
+        pg_loss = pg_loss + auxiliary_loss
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -122,7 +141,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add entropy loss
     if entropy is not None:
         entropy_loss = agg_loss(
-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+            loss_mat=entropy,
+            loss_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            loss_weights=trajectory_loss_weights,
+            **config.global_batch_info,
         )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
@@ -134,7 +157,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
         kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
+            loss_mat=kld,
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            loss_weights=trajectory_loss_weights,
+            **config.global_batch_info,
         )
 
         policy_loss += kl_loss * config.kl_loss_coef

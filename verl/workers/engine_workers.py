@@ -461,6 +461,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
+        self.compaction_teacher = None
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
         self.rollout: BaseRollout = None
@@ -699,6 +700,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output.cpu() if output is not None else None
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_compaction_teacher(self, rate: float):
+        from verl.workers.engine.fsdp.ema import FSDPTeacherEMA
+
+        if self.config.actor.strategy != "fsdp2":
+            raise ValueError("Compaction EMA teacher currently requires FSDP2.")
+        self.compaction_teacher = FSDPTeacherEMA(self.actor.engine.module, rate)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_compaction_teacher(self, version: int):
+        self.compaction_teacher.update(version)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def compute_compaction_teacher_log_prob(self, data: TensorDict) -> TensorDict:
+        with self.compaction_teacher.apply():
+            output = self.actor.infer_batch(data)
+        return output.cpu() if output is not None else None
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
@@ -710,11 +729,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+        if self.compaction_teacher is not None:
+            path = os.path.join(local_path, f"compaction_ema_world_size_{self.world_size}_rank_{self.rank}.pt")
+            self.compaction_teacher.load(path)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        if self.compaction_teacher is not None:
+            path = os.path.join(local_path, f"compaction_ema_world_size_{self.world_size}_rank_{self.rank}.pt")
+            self.compaction_teacher.save(path, global_step)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):

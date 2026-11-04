@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "CompactionDistortionConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -57,6 +63,23 @@ class FilterGroupsConfig(BaseConfig):
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
     max_inflight_gen_batches: int = 1
+
+
+@dataclass
+class CompactionDistortionConfig(BaseConfig):
+    """RECAP design choices; defaults reproduce the final rollout-scored method."""
+
+    enabled: bool = False
+    # None inherits coef; an explicit zero disables that auxiliary objective.
+    coef: float = 0.1
+    summary_pg_coef: Optional[float] = None
+    continuation_sd_coef: Optional[float] = None
+    summary_baseline: str = "leave_one_out"  # leave_one_out | none
+    scoring_policy: str = "pi_rollout"  # pi_rollout | pi_fsdp
+    sd_advantage_clip: Optional[float] = 5.0
+    teacher_ema_rate: Optional[float] = None  # New actor weight in each teacher update.
+    clipping: str = "joint"  # joint | separate
+    distortion_measure_interval: int = 0
 
 
 @dataclass
@@ -633,6 +656,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        compaction_distortion (CompactionDistortionConfig): Compression distortion and self-distillation objectives.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -661,6 +685,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    compaction_distortion: CompactionDistortionConfig = field(default_factory=CompactionDistortionConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

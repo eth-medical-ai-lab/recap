@@ -81,6 +81,16 @@ def addition_process(output: DataProto):
     return output
 
 
+def _align_non_tensor_batch_keys(batches: list[DataProto]) -> None:
+    """Fill absent metadata so heterogeneous rollout batches can be concatenated."""
+    all_keys = set().union(*(batch.non_tensor_batch.keys() for batch in batches))
+    for batch in batches:
+        for key in all_keys - batch.non_tensor_batch.keys():
+            missing_values = np.empty(len(batch), dtype=object)
+            missing_values[:] = None
+            batch.non_tensor_batch[key] = missing_values
+
+
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
@@ -115,6 +125,9 @@ def assemble_batch_from_rollout_samples(
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
         rollout_samples_batch.append(batch)
+
+    # Optional episode metadata can differ across queued rollout batches.
+    _align_non_tensor_batch_keys(rollout_samples_batch)
     final_batch = DataProto.concat(rollout_samples_batch)
 
     # Calculate response_mask (if not present)
@@ -150,15 +163,22 @@ def assemble_batch_from_rollout_samples(
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
-    param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+    # An E2B reset failure never sampled the model and therefore has no policy
+    # version. Keep its reward slot, but exclude it from version diagnostics.
+    trainable_rows = final_batch.batch["response_mask"].any(dim=-1).cpu().tolist()
+    version_pairs = [(start, end) for start, end, trainable in
+                     zip(param_version_start, param_version_end, trainable_rows, strict=True) if trainable]
+    if any(start is None or end is None for start, end in version_pairs):
+        raise ValueError("A trainable rollout is missing its policy version.")
+    param_version_diff = [abs(end - start) for start, end in version_pairs]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
         "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
-        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
-        "fully_async/partial/max_partial_span": max(param_version_diff),
+        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / max(1, len(param_version_diff)),
+        "fully_async/partial/max_partial_span": max(param_version_diff, default=0),
     }
     # add meta_info
-    trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
+    trajectory_param_versions = np.array([end for _, end in version_pairs])
 
     final_batch.meta_info.update(
         {
@@ -212,6 +232,9 @@ class MetricsAggregator:
             "max": ["timing_s/agent_loop/tool_calls/max"],
             "last": [
                 "fully_async/count/total_generated_samples",
+                "fully_async/swe/environment_failures_recent",
+                "fully_async/swe/rollouts_recent",
+                "fully_async/swe/stopped_for_environment_failures",
                 "fully_async/count/stale_samples_processed",
                 "fully_async/count/stale_trajectory_processed",
                 "fully_async/count/current_param_version",

@@ -72,6 +72,7 @@ class DynamicScheduleContext:
         total_generated_samples: Cumulative rollout samples since training began.
         expected_samples: Theoretical samples needed up to the current sync step.
         buffer_samples: Allowed buffer headroom (expected × staleness_threshold).
+        queued_samples: Completed groups currently available to the trainer.
         step_wait_times: Per-collection wait times within the latest step (seconds).
         step_wait_samples: Per-collection count of samples that actually had to be
             waited on (i.e. not already sitting in the queue) — ``max(0,
@@ -94,6 +95,7 @@ class DynamicScheduleContext:
     step_wait_times: list[float] = field(default_factory=list)
     step_wait_samples: list[int] = field(default_factory=list)
     only_hybrid: bool = False
+    queued_samples: int = 0
 
     # Activation / deactivation timing (seconds)
     last_activate_duration_s: float = 0.0

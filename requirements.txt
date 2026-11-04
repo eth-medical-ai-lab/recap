@@ -1,7 +1,14 @@
-# requirements.txt records the full set of dependencies for development
+# RECAP source checkout: Python 3.12, Linux, NVIDIA CUDA 13.
+# Install the CUDA-matched PyTorch build first; see README.md.
+torch==2.11.0
+vllm==0.26.0
+transformers==5.5.3
+cupy-cuda13x==14.0.1
+
+# verl runtime
 accelerate
 codetiming
-datasets
+datasets>=4.0.0
 dill
 hydra-core
 liger-kernel
@@ -11,13 +18,9 @@ peft
 pyarrow>=19.0.0
 pybind11
 pylatexenc
-pre-commit
-ray[default]
+ray[default]>=2.41.0
 tensordict>=0.8.0,<=0.10.0,!=0.9.0
 torchdata
-# 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for sink-less
-# models like Qwen2/Llama); fixed in 5.6.1. See huggingface/transformers#45588.
-transformers>=5.5.3,!=5.6.0,<5.11
 wandb
 packaging>=20.0
 uvicorn
@@ -26,3 +29,20 @@ latex2sympy2_extended
 math_verify
 tensorboard
 TransferQueue==0.1.8
+
+# Qwen3.5 kernels. Install flash-attn and causal-conv1d separately after Torch
+# with --no-build-isolation, as shown in README.md.
+flash-linear-attention==0.5.2
+fla-core==0.5.2
+ninja
+wheel
+
+# BrowseComp-Plus tools and dense retrieval
+fastmcp==2.12.5
+httpx>=0.27.0
+faiss-cpu==1.12.0
+tevatron @ git+https://github.com/texttron/tevatron.git@dd063104c81a76d6a77c845f667b46b9e5abd625
+
+# SWE-agent E2B sandbox and canonical grader
+e2b==2.46.4
+swebench==5.0.2

@@ -136,8 +136,8 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         :meth:`_has_positive_net_benefit` so both use the same reference point.
         """
         deactivate_threshold = self.deactivate_ratio * ctx.step_required_samples
-        surplus = ctx.total_generated_samples - ctx.expected_samples
-        return deactivate_threshold - surplus
+        # Production counters do not count batches consumed from an existing backlog.
+        return deactivate_threshold - ctx.queued_samples
 
     def _estimate_per_sample_time(self, ctx: DynamicScheduleContext) -> float:
         """Estimate standalone-only wall-clock time to produce one sample.
@@ -199,6 +199,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             f" ctx.expected_samples:{ctx.expected_samples},"
             f" self.deactivate_ratio:{self.deactivate_ratio},"
             f" ctx.buffer_samples:{ctx.buffer_samples}"
+            f" queued_samples:{ctx.queued_samples}"
         )
         print(f"DynamicScheduleContext:{ctx}")
 

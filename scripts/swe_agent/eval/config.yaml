@@ -1,0 +1,131 @@
+# Defaults for our Qwen3.5-4B SWE-bench Verified protocol. Export checkpoints separately.
+defaults:
+  - ppo_trainer
+  - _self_
+
+evaluation:
+  dataset: swebench_verified
+  split: test
+  model_path: ???
+  output_dir: ???
+  model_step: 0
+  data_path: data/swe_agent/tasks/test.jsonl
+  max_tasks: null  # null means all tasks; an integer selects the first N in dataset order.
+  samples_per_task: 2
+  max_active_episodes: 100  # Bounds whole episodes, including sandbox setup and grading.
+  workers: 20
+  nodes: 1
+  gpus_per_node: 4
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  compaction_threshold: 32768
+  max_compactions: 3  # Set to 0 for full context, with max_model_len=131072.
+  max_model_len: 65536
+
+data:
+  max_prompt_length: 32768
+  max_response_length: 131072
+  return_raw_chat: true
+  filter_overlong_prompts: false
+  truncation: error
+  shuffle: false
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  continuous_token:
+    enable: true
+    model_family: qwen35
+
+actor_rollout_ref:
+  hybrid_engine: false
+  model:
+    path: ${evaluation.model_path}
+    hf_config_path: null
+    tokenizer_path: null
+    use_remove_padding: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: triton
+  rollout:
+    name: vllm
+    mode: async
+    nnodes: ${evaluation.nodes}
+    n_gpus_per_node: ${evaluation.gpus_per_node}
+    tensor_model_parallel_size: 1
+    agent:
+      default_agent_loop: gym_agent
+      agent_loop_config_path: agent_system/agent_loop.yaml
+      num_workers: ${evaluation.workers}
+    multi_turn:
+      enable: true
+      format: qwen3_coder
+      max_assistant_turns: 200
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    max_model_len: ${evaluation.max_model_len}
+    max_num_batched_tokens: 4096
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.70
+    standalone_gpu_memory_utilization: 0.70
+    load_format: auto
+    free_cache_engine: false
+    enable_sleep_mode: false
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    calculate_log_probs: false
+    disable_log_stats: false
+    # Backend initialization only. Never inject a seed into generation requests.
+    seed: 42
+    full_determinism: false
+    temperature: ${evaluation.temperature}
+    top_p: ${evaluation.top_p}
+    top_k: ${evaluation.top_k}
+    repetition_penalty: 1.0
+    n: ${evaluation.samples_per_task}
+    val_kwargs:
+      do_sample: true
+      temperature: ${evaluation.temperature}
+      top_p: ${evaluation.top_p}
+      top_k: ${evaluation.top_k}
+      n: ${evaluation.samples_per_task}
+    checkpoint_engine:
+      backend: naive
+    trace:
+      project_name: swe_agent
+      experiment_name: swe_evaluation
+
+algorithm:
+  compaction_distortion:
+    enabled: false
+
+trainer:
+  val_only: true
+  logger: [console]
+  project_name: swe_agent
+  experiment_name: swe_evaluation
+  nnodes: ${evaluation.nodes}
+  n_gpus_per_node: ${evaluation.gpus_per_node}
+  log_val_trajectory_txt: 1
+  gym_env_kwargs:
+    data_path: ${evaluation.data_path}
+    dataset: ${evaluation.dataset}
+    e2b_timeout_seconds: 5400
+    e2b_run_id: swe_evaluation
+    e2b_create_concurrency: 8
+    e2b_create_max_retries: 4
+    max_turns: 200
+    command_timeout_seconds: 120
+    evaluation_timeout_seconds: 600
+    observation_char_cap: 6000
+    max_format_errors: 3
+  gym_max_tokens: 4096  # Match the current checkpoints' training response cap.
+  gym_max_episode_tokens: 131072
+  gym_rollout_timeout_seconds: 21600
+  gym_swebench_solution_dir: null
+  gym_compaction_enabled: true  # Derived from max_compactions by the entry point.
+  gym_compaction_max_compactions: ${evaluation.max_compactions}
+  gym_compaction_keep_recent_turns: 1
+  gym_compaction_max_tokens: 8192
+  gym_compaction_context_threshold: ${evaluation.compaction_threshold}

@@ -33,8 +33,15 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from agent_system.metrics import (
+    EPISODE_FIELD_KEYS,
+    FORMAT_FIELD_KEYS,
+    compute_episode_metrics,
+    compute_format_metrics,
+)
+from agent_system.trajectory_logging import log_train_trajectories_to_wandb, log_trajectories_to_wandb
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -47,6 +54,16 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
+)
+from verl.trainer.ppo.recap import (
+    align_batch_to_generation_output,
+    apply_recap_advantage,
+    compute_grpo_segment_advantage,
+    pad_compaction_batch_for_data_parallel,
+    prepare_recap_advantages,
+    recap_needs_scoring,
+    remove_compaction_padding,
+    unpad_generation_output,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -236,13 +253,17 @@ def compute_advantage(
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
+        # Compaction emits several rows for one rollout. Normalize rewards over
+        # complete rollouts, then give all of their trainable tokens one advantage.
+        if "compaction_trajectory_uid" in data.non_tensor_batch:
+            advantages, returns = compute_grpo_segment_advantage(data, norm_adv_by_std_in_grpo)
+        else:
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -535,6 +556,13 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            for key in EPISODE_FIELD_KEYS:
+                if key in batch.non_tensor_batch:
+                    values = batch.non_tensor_batch[key]
+                    reward_extra_infos_to_dump.setdefault(
+                        key,
+                        values.tolist() if hasattr(values, "tolist") else values,
+                    )
 
             self._dump_generations(
                 inputs=inputs,
@@ -568,6 +596,12 @@ class RayPPOTrainer:
 
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
+    def _maybe_log_val_trajectory_txt(self, paths, scores):
+        log_trajectories_to_wandb(paths, scores, self.config.trainer, self.global_steps, validate=True)
+
+    def _maybe_log_train_trajectory_txt(self, batch: DataProto):
+        log_train_trajectories_to_wandb(batch, self.config.trainer, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -604,6 +638,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_trajectory_paths = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -618,11 +653,6 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -636,6 +666,7 @@ class RayPPOTrainer:
 
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            original_test_gen_len = len(test_gen_batch)
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
@@ -650,7 +681,11 @@ class RayPPOTrainer:
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = unpad_generation_output(
+                test_output_gen_batch_padded,
+                original_len=original_test_gen_len,
+                pad_size=pad_size,
+            )
 
             print("validation generation end")
 
@@ -659,8 +694,19 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            test_batch, test_output_gen_batch = align_batch_to_generation_output(test_batch, test_output_gen_batch)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+            if "gym_trajectory_txt_path" in test_batch.non_tensor_batch:
+                paths = test_batch.non_tensor_batch["gym_trajectory_txt_path"]
+                sample_trajectory_paths.extend(paths.tolist() if hasattr(paths, "tolist") else list(paths))
+            else:
+                sample_trajectory_paths.extend([None] * len(test_batch))
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
@@ -684,6 +730,15 @@ class RayPPOTrainer:
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
+            for key in (*EPISODE_FIELD_KEYS, *FORMAT_FIELD_KEYS):
+                if key in reward_extra_info or key not in test_batch.non_tensor_batch:
+                    continue
+                values = test_batch.non_tensor_batch[key]
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
@@ -691,6 +746,7 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_trajectory_txt(paths=sample_trajectory_paths, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -721,6 +777,16 @@ class RayPPOTrainer:
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
+        # Log interpretable episode rates alongside the per-question @n metrics.
+        # Validation emits one row per completed rollout, including truncations.
+        for data_source in np.unique(data_sources):
+            keep = np.asarray(data_sources) == data_source
+            episode_batch = DataProto(non_tensor_batch={
+                key: np.asarray(values, dtype=object)[keep]
+                for key, values in reward_extra_infos_dict.items()
+                if key in EPISODE_FIELD_KEYS and len(values) == len(data_sources)
+            })
+            metric_dict.update(compute_episode_metrics(episode_batch, prefix=f"val-episode/{data_source}"))
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
@@ -1262,7 +1328,7 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(self, batch: DataProto, *, use_ema=False):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
@@ -1276,7 +1342,10 @@ class RayPPOTrainer:
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
-        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        if use_ema:
+            output = self.actor_rollout_wg.compute_compaction_teacher_log_prob(batch_td)
+        else:
+            output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
         entropy = tu.get(output, "entropy")
         log_probs = tu.get(output, "log_probs")
@@ -1298,6 +1367,14 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
+
+    def _compute_compaction_distortion(self, batch: DataProto) -> tuple[DataProto, dict[str, float]]:
+        # Trainer scoring bypasses the fully async old-policy snapshot.
+        return prepare_recap_advantages(
+            batch,
+            self,
+            lambda scoring_batch, **kwargs: RayPPOTrainer._compute_old_log_prob(self, scoring_batch, **kwargs),
+        )
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1329,8 +1406,7 @@ class RayPPOTrainer:
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
-        tu.assign_non_tensor(
-            batch_td,
+        batch_info = dict(
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             distillation_only=distillation_only,
@@ -1341,6 +1417,12 @@ class RayPPOTrainer:
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
         )
+        if "compaction_trajectory_uid" in batch.non_tensor_batch:
+            # Keep all segments of a logical trajectory in the same optimizer update.
+            batch_info.pop("mini_batch_size")
+            batch_info["global_batch_size"] = batch.meta_info["compaction_trajectory_count"]
+            batch_info["num_mini_batch"] = 1
+        tu.assign_non_tensor(batch_td, **batch_info)
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
@@ -1493,11 +1575,11 @@ class RayPPOTrainer:
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
 
-                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
-                    if "__do_sample__" in gen_batch_output.non_tensor_batch:
-                        gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                        if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                            gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
                         if "__do_sample__" in gen_baseline_output.non_tensor_batch:
                             gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
@@ -1510,13 +1592,20 @@ class RayPPOTrainer:
                         batch.batch["reward_baselines"] = reward_baseline_tensor
 
                         del gen_baseline_output
+                    else:
+                        gen_batch_output = combined_gen_output
+                        if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                            gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch, gen_batch_output = align_batch_to_generation_output(batch, gen_batch_output)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                    batch = pad_compaction_batch_for_data_parallel(batch, actor_dp_size)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1549,23 +1638,35 @@ class RayPPOTrainer:
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                        actor_config = self.config.actor_rollout_ref.actor
+                        if actor_config.loss_agg_mode == "trajectory-mean-token-mean":
+                            # Compaction supplies logical-trajectory weights to the
+                            # vanilla clipped loss. Bypass only selects pi_rollout
+                            # as its denominator.
+                            if "rollout_log_probs" not in batch.batch:
+                                raise ValueError("bypass_mode=True requires rollout_log_probs in the batch.")
+                            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                        else:
+                            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
-                        apply_bypass_mode(
-                            batch=batch,
-                            rollout_corr_config=rollout_corr_config,
-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                        )
+                            apply_bypass_mode(
+                                batch=batch,
+                                rollout_corr_config=rollout_corr_config,
+                                policy_loss_config=actor_config.policy_loss,
+                            )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
+                            entropy_loss_mode = actor_config.loss_agg_mode
+                            if entropy_loss_mode == "trajectory-mean-token-mean":
+                                entropy_loss_mode = "seq-mean-token-mean"
                             entropy_agg = agg_loss(
                                 loss_mat=entropys,
                                 loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
+                                loss_agg_mode=entropy_loss_mode,
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
                             old_log_prob_metrics = {
@@ -1590,6 +1691,11 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    distortion_config = self.config.algorithm.get("compaction_distortion", {})
+                    if recap_needs_scoring(distortion_config, self.global_steps):
+                        with marked_timer("compaction_distortion", timing_raw, color="blue"):
+                            batch, distortion_metrics = self._compute_compaction_distortion(batch)
+                        metrics.update(distortion_metrics)
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -1648,6 +1754,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        batch = apply_recap_advantage(batch, self.config.algorithm.get("compaction_distortion", {}))
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1693,10 +1800,13 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    batch, reward_extra_infos_dict = remove_compaction_padding(batch, reward_extra_infos_dict)
+
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    self._maybe_log_train_trajectory_txt(batch)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (
@@ -1734,6 +1844,8 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_episode_metrics(batch=batch))
+                metrics.update(compute_format_metrics(batch=batch))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

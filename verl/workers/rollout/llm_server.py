@@ -437,6 +437,13 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 min_global_steps = global_steps
             max_global_steps = global_steps
 
+            # RECAP teacher scoring uses prompt log probabilities. They
+            # describe this completed request, so preserve the latest returned
+            # values while partial-rollout responses are assembled.
+            for key in ("prompt_ids", "prompt_logprobs"):
+                if key in output.extra_fields:
+                    final_output.extra_fields[key] = output.extra_fields[key]
+
             # 3. update max_new_tokens
             if original_max_tokens is not None:
                 sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)

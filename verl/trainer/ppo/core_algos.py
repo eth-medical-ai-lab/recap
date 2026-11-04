@@ -1145,6 +1145,7 @@ def agg_loss(
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
+    loss_weights: Optional[torch.Tensor] = None,
 ):
     """
     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
@@ -1162,12 +1163,23 @@ def agg_loss(
         global_batch_size: global batch size
         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
             Set this to a constant value to ensure consistent normalization throughout training.
+        loss_weights: optional per-token weights used by "trajectory-mean-token-mean".
 
     Returns:
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
-    if loss_agg_mode == "token-mean":
+    if loss_agg_mode == "trajectory-mean-token-mean":
+        if loss_weights is None:
+            raise ValueError("loss_weights is required for trajectory-mean-token-mean")
+        if loss_weights.shape != loss_mask.shape:
+            raise ValueError(f"loss_weights shape {loss_weights.shape} does not match loss mask {loss_mask.shape}")
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = loss_weights.sum()
+        loss = torch.sum(loss_mat * loss_mask * loss_weights) / global_batch_size * dp_size
+    elif loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
@@ -1291,6 +1303,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    trajectory_loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1365,7 +1378,11 @@ def compute_policy_loss_vanilla(
         pg_losses = pg_losses * rollout_is_weights
 
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=trajectory_loss_weights,
+        **config.global_batch_info,
     )
 
     pg_metrics = {

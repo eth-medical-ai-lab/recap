@@ -155,6 +155,8 @@ class vLLMHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
+        self._generation_paused = False
+        self._generation_tasks: set[asyncio.Task] = set()
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -613,25 +615,38 @@ class vLLMHttpServer:
                 )
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
-            generator = self.engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-                priority=priority,
-            )
-
-            # Get final response
             final_res: Optional[RequestOutput] = None
-            async for output in generator:
-                final_res = output
-            assert final_res is not None
+            interrupted = self._generation_paused
+
+            async def collect_output():
+                nonlocal final_res
+                async for output in self.engine.generate(
+                    prompt=prompt, sampling_params=sampling_params, request_id=request_id,
+                    lora_request=lora_request, priority=priority,
+                ):
+                    final_res = output
+
+            # A client may have acquired this replica just before routing removed
+            # it. Track admission as well as execution: vLLM queues late arrivals
+            # on a paused scheduler, where they otherwise wait until reactivation.
+            if not interrupted:
+                task = asyncio.create_task(collect_output())
+                self._generation_tasks.add(task)
+                try:
+                    await task
+                except asyncio.CancelledError as error:
+                    if error.args != ("rollout_paused",):
+                        raise
+                    interrupted = True
+                finally:
+                    self._generation_tasks.discard(task)
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
-        if not final_res.outputs:
+        assert final_res is not None or interrupted
+        if final_res is None or not final_res.outputs:
             return TokenOutput(
                 token_ids=[],
                 log_probs=None,
@@ -655,7 +670,7 @@ class vLLMHttpServer:
             routed_experts = final_res.outputs[0].routed_experts
 
         # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
+        finish_reason = "abort" if interrupted else final_res.outputs[0].finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
@@ -864,6 +879,7 @@ class vLLMHttpServer:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
+        self._generation_paused = True
         try:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
@@ -883,6 +899,17 @@ class vLLMHttpServer:
                 clear_cache=reset_prefix_cache,
             )
 
+            # Finish late admissions too, preserving any partial output already
+            # collected. Explicitly clear internal IDs in case cancellation hit
+            # add_request before AsyncLLM.generate received its output collector.
+            pending = tuple(self._generation_tasks)
+            for task in pending:
+                task.cancel("rollout_paused")
+            await asyncio.gather(*pending, return_exceptions=True)
+            remaining_ids = list(self.engine.output_processor.request_states)
+            if remaining_ids:
+                await self.engine.abort(remaining_ids, internal=True)
+
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -895,6 +922,7 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
         await self.engine.resume_generation()
+        self._generation_paused = False
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.

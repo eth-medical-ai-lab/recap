@@ -115,6 +115,11 @@ def get_ppo_ray_runtime_env(config=None):
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    for key in ("WANDB_ENTITY", "WANDB_RUN_ID", "WANDB_RESUME", "WANDB_DIR"):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
+
     # Always forward these at call-time, not import-time.
     for key in ("VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")

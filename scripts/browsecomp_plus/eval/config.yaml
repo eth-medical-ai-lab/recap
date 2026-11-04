@@ -1,0 +1,130 @@
+# Shared Qwen3.5-4B evaluation protocol; export training checkpoints separately.
+defaults:
+  - ppo_trainer
+  - _self_
+
+evaluation:
+  model_path: ???
+  output_dir: ???
+  model_step: 0
+  data_path: data/browsecomp_plus/rollouts/test.jsonl
+  task_path: data/browsecomp_plus/tasks/test.jsonl
+  max_tasks: null
+  samples_per_task: 2
+  workers: 16
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  compaction_threshold: 32768
+  max_compactions: 3
+  max_model_len: 131072
+  max_turns: 100
+  max_response_tokens: 8192
+  max_summary_tokens: 8192
+  judge_workers: 8
+  wandb: false
+  # Use native for full-context Qwen3.5-4B tool calling over HTTP.
+  backend: gym
+
+data:
+  train_files: []
+  val_files: ${evaluation.data_path}
+  max_prompt_length: 16384
+  max_response_length: 131072
+  return_raw_chat: true
+  filter_overlong_prompts: false
+  truncation: error
+  shuffle: false
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  seed: null
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  continuous_token:
+    enable: true
+    model_family: qwen35
+
+actor_rollout_ref:
+  hybrid_engine: false
+  model:
+    path: ${evaluation.model_path}
+    hf_config_path: null
+    tokenizer_path: null
+    use_remove_padding: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: triton
+  rollout:
+    name: vllm
+    mode: async
+    nnodes: 1
+    n_gpus_per_node: 4
+    tensor_model_parallel_size: 1
+    agent:
+      default_agent_loop: gym_agent
+      agent_loop_config_path: agent_system/agent_loop.yaml
+      num_workers: ${evaluation.workers}
+    multi_turn:
+      enable: true
+      format: qwen3_coder
+      max_assistant_turns: ${evaluation.max_turns}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    max_model_len: ${evaluation.max_model_len}
+    max_num_batched_tokens: 16384
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.70
+    standalone_gpu_memory_utilization: 0.70
+    load_format: auto
+    free_cache_engine: true
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    calculate_log_probs: false
+    # The evaluator supplies fresh OS entropy at startup, never a fixed/request seed.
+    seed: null
+    full_determinism: false
+    temperature: ${evaluation.temperature}
+    top_p: ${evaluation.top_p}
+    top_k: ${evaluation.top_k}
+    repetition_penalty: 1.0
+    n: ${evaluation.samples_per_task}
+    val_kwargs:
+      do_sample: true
+      temperature: ${evaluation.temperature}
+      top_p: ${evaluation.top_p}
+      top_k: ${evaluation.top_k}
+      n: ${evaluation.samples_per_task}
+    checkpoint_engine:
+      backend: naive
+    trace:
+      project_name: browsecomp_plus
+      experiment_name: bcplus_evaluation
+
+algorithm:
+  compaction_distortion:
+    enabled: false
+
+trainer:
+  val_only: true
+  logger: [console]
+  project_name: browsecomp_plus
+  experiment_name: bcplus_evaluation
+  nnodes: 1
+  n_gpus_per_node: 4
+  log_val_trajectory_txt: 1
+  gym_env_kwargs:
+    data_path: ${evaluation.task_path}
+    ray_pool_size: 1
+    ray_worker_num_cpus: 0.5
+    mcp_url: ${oc.env:BROWSECOMP_PLUS_MCP_URL,http://127.0.0.1:8080/mcp}
+    judge_url: ${oc.env:BROWSECOMP_PLUS_JUDGE_URL,http://127.0.0.1:9000}
+    judge_model: Qwen/Qwen3.8-27B
+    defer_judge: true
+  gym_max_tokens: ${evaluation.max_response_tokens}
+  gym_max_episode_tokens: null
+  gym_rollout_timeout_seconds: null
+  gym_compaction_enabled: true
+  gym_compaction_max_compactions: ${evaluation.max_compactions}
+  gym_compaction_keep_recent_turns: 1
+  gym_compaction_max_tokens: ${evaluation.max_summary_tokens}
+  gym_compaction_context_threshold: ${evaluation.compaction_threshold}
