@@ -2,7 +2,7 @@
 
 [Yulun Jiang](https://yljblues.github.io), [Maria Brbić†](https://brbiclab.epfl.ch/team/), [Michael Moor†](https://michaelmoor.me/)
 
-[`Project page`](https://recap-site.github.io) | [`Paper`](paper/recap.pdf) | [`BibTeX`](#citing)
+[`Project page`](https://recap-site.github.io) | [`Paper`](https://arxiv.org/pdf/2611.31258) | [`BibTeX`](#citing)
 
 ---
 
@@ -76,9 +76,10 @@ We also thank [Swiss AI](https://github.com/swiss-ai) for its generous support w
 If you use RECAP in your research, please consider citing the paper.
 
 ```bibtex
-@misc{jiang2026recap,
-  title={RECAP: Training Long-horizon LLM Agents with Context Compaction},
-  author={Yulun Jiang and Maria Brbic and Michael Moor},
+@article{jiang2026recap,
+  title={{RECAP}: Training Long-horizon LLM Agents with Context Compaction},
+  author={Jiang, Yulun and Brbi{\'c}, Maria and Moor, Michael},
+  journal={arXiv preprint arXiv:2611.31258},
   year={2026},
 }
 ```
